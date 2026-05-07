@@ -7,7 +7,7 @@ use good_lp::{constraint, default_solver, variable, variables, Expression, Solve
 
 type ResTable = Vec<Vec<i32>>;
 
-pub trait CostModel {
+pub trait MachineModel {
     fn get_rt(&self, op: &str) -> ResTable;
 }
 
@@ -22,16 +22,16 @@ pub struct EdgeData {
 pub struct TileLang {
     pub op: Symbol,
     pub children: Vec<Id>,
-    pub edge_attrs: Vec<(i32, i32)>,
+    pub edge_data: Vec<(i32, i32)>,
 }
 
 impl TileLang {
     pub fn new(
         op: impl Into<Symbol>,
         children: Vec<Id>,
-        edge_attrs: Vec<(i32, i32)>,
+        edge_data: Vec<(i32, i32)>,
     ) -> Self {
-        Self { op: op.into(), children, edge_attrs }
+        Self { op: op.into(), children, edge_data }
     }
 
     pub fn leaf(op: impl Into<Symbol>) -> Self {
@@ -41,24 +41,22 @@ impl TileLang {
     pub fn edges(&self) -> impl Iterator<Item = EdgeData> + '_ {
         self.children
             .iter()
-            .zip(&self.edge_attrs)
+            .zip(&self.edge_data)
             .map(|(&id, &(d, delta))| EdgeData { id, d, delta })
     }
 }
 
-/// Modulo reservation table at the given II: `ii` rows × `n_resources` cols.
-/// Sums each cycle of the unfolded `rt` into row (cycle mod ii).
-fn modulo_rt(rt: &ResTable, ii: usize, n_resources: usize) -> Vec<Vec<i32>> {
-    let mut tbl = vec![vec![0; n_resources]; ii];
+fn modulo_rt(rt: &ResTable, ii: usize, n_resources: usize) -> ResTable {
+    let mut mrt = vec![vec![0; n_resources]; ii];
     for (row_idx, row) in rt.iter().enumerate() {
         let target = row_idx % ii;
         for (col_idx, &val) in row.iter().enumerate() {
             if col_idx < n_resources {
-                tbl[target][col_idx] += val;
+                mrt[target][col_idx] += val;
             }
         }
     }
-    tbl
+    mrt
 }
 
 impl PartialEq for TileLang {
@@ -114,138 +112,32 @@ impl FromOp for TileLang {
     }
 }
 
-/// Modulo-scheduling extractor that returns the minimum feasible initiation
-/// interval for the (singleton) e-graph, in the style of [`egg::LpExtractor`].
-///
-/// Mirrors `schedule_graph` in `src/ilp-modulo-sched.py`: for each candidate
-/// II, sets up the same ILP (T, K, A, B, span variables; precedence, dep,
-/// buffer, modulo-resource constraints) and minimises span. The first
-/// feasible II is returned.
-pub struct SwpExtractor<'a, N: Analysis<TileLang>, C: CostModel> {
+pub struct SwpExtractor<'a, N: Analysis<TileLang>, C: MachineModel> {
     egraph: &'a EGraph<TileLang, N>,
-    cost_model: C,
+    machine_model: C,
     resource_limits: Vec<i32>,
 }
 
-impl<'a, N: Analysis<TileLang>, C: CostModel> SwpExtractor<'a, N, C> {
+impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
     pub fn new(
         egraph: &'a EGraph<TileLang, N>,
-        cost_model: C,
+        machine_model: C,
         resource_limits: Vec<i32>,
     ) -> Self {
-        Self { egraph, cost_model, resource_limits }
+        Self { egraph, machine_model, resource_limits }
     }
 
     pub fn solve(&self) -> usize {
         for ii in 1..=64 {
-            if self.try_ii(ii) {
+            if self.solve_at(ii) {
                 return ii;
             }
         }
-        panic!("no feasible II up to 64");
+        panic!("could not find feasible II");
     }
 
-    fn try_ii(&self, ii: usize) -> bool {
-        let classes: Vec<_> = self.egraph.classes().collect();
-        let n = classes.len();
-        let class_idx: HashMap<Id, usize> = classes
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.id, i))
-            .collect();
-        let n_resources = self.resource_limits.len();
-        let rt: Vec<ResTable> = classes
-            .iter()
-            .map(|c| self.cost_model.get_rt(c.nodes[0].op.as_str()))
-            .collect();
-
-        let mut vars = variables!();
-        let t: Vec<_> = (0..n)
-            .map(|_| vars.add(variable().integer().min(0)))
-            .collect();
-        let k: Vec<_> = (0..n)
-            .map(|_| vars.add(variable().integer().min(0)))
-            .collect();
-        let buf: Vec<_> = (0..n)
-            .map(|_| vars.add(variable().integer().min(0)))
-            .collect();
-        let a: Vec<Vec<_>> = (0..ii)
-            .map(|_| (0..n).map(|_| vars.add(variable().binary())).collect())
-            .collect();
-        let span = vars.add(variable().integer().min(0));
-
-        let mut model = vars.minimise(span).using(default_solver);
-
-        // 1. Span: t[i] + cost(i) <= span
-        for i in 0..n {
-            let cost = rt[i].len() as f64;
-            model.add_constraint(constraint!(t[i] + cost <= span));
-        }
-
-        // 2. Each job starts exactly once: sum_t a[t][i] == 1
-        for i in 0..n {
-            let mut sum: Expression = 0.0.into();
-            for tt in 0..ii {
-                sum = sum + a[tt][i];
-            }
-            model.add_constraint(constraint!(sum == 1));
-        }
-
-        // 3. Precedence: t[i] == ii * k[i] + sum_t (t * a[t][i])
-        for i in 0..n {
-            let mut weighted: Expression = 0.0.into();
-            for tt in 0..ii {
-                weighted = weighted + (tt as f64) * a[tt][i];
-            }
-            let rhs: Expression = (ii as f64) * k[i] + weighted;
-            model.add_constraint(constraint!(t[i] == rhs));
-        }
-
-        // 4. Dependence: T[dst] - T[src] >= delay - II * distance
-        //    In our e-graph, parent = consumer (dst), child = producer (src).
-        for (dst, class) in classes.iter().enumerate() {
-            let node = &class.nodes[0];
-            for edge in node.edges() {
-                let v_id = self.egraph.find(edge.id);
-                let src = class_idx[&v_id];
-                let rhs = (edge.d as f64) - (ii as f64) * (edge.delta as f64);
-                model.add_constraint(constraint!(t[dst] - t[src] >= rhs));
-            }
-        }
-
-        // 5. Buffer: II*B[src] + T[src] - T[dst] >= II*(distance + 1) - 1
-        for (dst, class) in classes.iter().enumerate() {
-            let node = &class.nodes[0];
-            for edge in node.edges() {
-                let v_id = self.egraph.find(edge.id);
-                let src = class_idx[&v_id];
-                let lhs: Expression = (ii as f64) * buf[src] + t[src] - t[dst];
-                let rhs = (ii as f64) * ((edge.delta as f64) + 1.0) - 1.0;
-                model.add_constraint(constraint!(lhs >= rhs));
-            }
-        }
-
-        // 6. Modulo resource: for each resource s and cycle t in [0, II),
-        //    sum over (i, l) of A[(t-l)%II, i] * modulo_rt, II)[l][s] <= R[s]
-        for s in 0..n_resources {
-            for tt in 0..ii {
-                let mut expr: Expression = 0.0.into();
-                for i in 0..n {
-                    let table = modulo_rt(&rt[i], ii, n_resources);
-                    for l in 0..ii {
-                        let coeff = table[l][s];
-                        if coeff == 0 {
-                            continue;
-                        }
-                        let idx = (tt as i32 - l as i32).rem_euclid(ii as i32) as usize;
-                        expr = expr + (coeff as f64) * a[idx][i];
-                    }
-                }
-                model.add_constraint(constraint!(expr <= self.resource_limits[s] as f64));
-            }
-        }
-
-        model.solve().is_ok()
+    fn solve_at(&self, ii: usize) -> bool {
+      todo!()
     }
 }
 
@@ -259,7 +151,7 @@ mod tests {
 
     pub struct TestCostModel;
 
-    impl CostModel for TestCostModel {
+    impl MachineModel for TestCostModel {
         fn get_rt(&self, op: &str) -> ResTable {
             match op {
                 // a/b/c/d toy problem.
