@@ -137,6 +137,19 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
     }
 
     fn solve_at(&self, ii: usize) -> bool {
+      let mut vars = variables!();
+      let n = self.egraph.number_of_classes(); // TODO: Should be num e-nodes
+      let t: Vec<_> = (0..n).map(|_| vars.add(variable().integer().min(0))).collect();
+      let k: Vec<_> = (0..n).map(|_| vars.add(variable().integer().min(0))).collect();
+      let a: Vec<Vec<_>> = (0..ii).map(|_| (0..n).map(|_| vars.add(variable().binary())).collect()).collect()
+      let last = vars.add(variable().integer().min(0));
+      let mut model = vars.minimise(last).using(default_solver);
+
+      for i in 0..n {
+        let d = self.machine_model.get_rt(...);
+        model.add_constraint(constraint!(t[i] + d));
+      }
+
       todo!()
     }
 }
