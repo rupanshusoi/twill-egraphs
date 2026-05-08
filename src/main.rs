@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 
 use egg::{Analysis, EGraph, FromOp, Id, Language, Symbol};
 use good_lp::{
-    Expression, Solution, SolverModel, constraint, default_solver, variable, variables,
+    Expression, Solution, SolverModel, Variable, constraint, default_solver, variable, variables,
 };
 
 type ResTable = Vec<Vec<i32>>;
@@ -165,123 +165,118 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
 
     fn solve_at(&self, ii: usize, roots: &[Id]) -> Option<SwpSolution> {
         let n_resources = self.resource_limits.len();
+        const M: i32 = 1000;
 
-        let classes: Vec<_> = self.egraph.classes().collect();
-        let n = classes.len();
-        let class_idx: HashMap<Id, usize> =
-            classes.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
+        let mut vars = variables!();
 
-        // Flat e-node indexing: e-node `m` lives in class `i` at offset `m - node_offset[i]`.
-        let mut node_offset: Vec<usize> = Vec::with_capacity(n + 1);
-        node_offset.push(0);
-        for class in &classes {
-            node_offset.push(node_offset.last().unwrap() + class.nodes.len());
+        // Per-e-class LP variables.
+        let mut class_vars: HashMap<Id, ClassVars> = HashMap::new();
+        for class in self.egraph.classes() {
+            class_vars.insert(
+                class.id,
+                ClassVars {
+                    t: vars.add(variable().integer().min(0)),
+                    k: vars.add(variable().integer().min(0)),
+                    y: vars.add(variable().binary()),
+                },
+            );
         }
-        let n_nodes = node_offset[n];
 
-        // Pre-compute per-e-node cost and resource table.
-        let mut node_cost: Vec<i32> = Vec::with_capacity(n_nodes);
-        let mut node_rt: Vec<ResTable> = Vec::with_capacity(n_nodes);
-        for class in &classes {
-            for node in &class.nodes {
+        // Per-e-node LP variables and pre-computed cost / folded resource table.
+        let mut node_vars: HashMap<(Id, usize), NodeVars> = HashMap::new();
+        let mut node_cost: HashMap<(Id, usize), i32> = HashMap::new();
+        let mut node_mrt: HashMap<(Id, usize), ResTable> = HashMap::new();
+        for class in self.egraph.classes() {
+            for (j, node) in class.nodes.iter().enumerate() {
+                let key = (class.id, j);
                 let rt = self.machine_model.get_rt(node.op.as_str());
-                node_cost.push(rt.len() as i32);
-                node_rt.push(rt);
+                node_cost.insert(key, rt.len() as i32);
+                node_mrt.insert(key, modulo_rt(&rt, ii, n_resources));
+                node_vars.insert(
+                    key,
+                    NodeVars {
+                        x: vars.add(variable().binary()),
+                        a: (0..ii).map(|_| vars.add(variable().binary())).collect(),
+                    },
+                );
             }
         }
 
-        // Big-M tight enough to deactivate dep constraints when x[m] = 0 without bloating
-        // the LP relaxation: bounds (d - II*delta) - (t[i] - t[src]) above for any
-        // schedule the LP could produce with this II.
-        let sum_costs: i32 = node_cost.iter().sum();
-        let max_d: i32 = classes
-            .iter()
-            .flat_map(|c| c.nodes.iter())
-            .flat_map(|node| node.edge_data.iter().map(|&(d, _)| d))
-            .max()
-            .unwrap_or(0);
-        let big_m = (ii as i32) * (sum_costs + 1) + max_d;
-
-        let mut vars = variables!();
-        let t: Vec<_> = (0..n)
-            .map(|_| vars.add(variable().integer().min(0)))
-            .collect();
-        let k: Vec<_> = (0..n)
-            .map(|_| vars.add(variable().integer().min(0)))
-            .collect();
-        let active: Vec<_> = (0..n).map(|_| vars.add(variable().binary())).collect();
-        let x: Vec<_> = (0..n_nodes).map(|_| vars.add(variable().binary())).collect();
-        let a: Vec<Vec<_>> = (0..ii)
-            .map(|_| (0..n_nodes).map(|_| vars.add(variable().binary())).collect())
-            .collect();
         let last_var = vars.add(variable().integer().min(0));
         let mut model = vars.minimise(last_var).using(default_solver);
 
         // Per-class constraints.
-        for i in 0..n {
-            let cls_lo = node_offset[i];
-            let cls_hi = node_offset[i + 1];
+        for class in self.egraph.classes() {
+            let cv = &class_vars[&class.id];
 
             // Selection: exactly one e-node per active class, none when inactive.
-            let sel: Expression = (cls_lo..cls_hi).map(|m| x[m]).sum();
-            model.add_constraint(constraint!(sel == active[i]));
+            let sel: Expression = (0..class.nodes.len())
+                .map(|j| node_vars[&(class.id, j)].x)
+                .sum();
+            model.add_constraint(constraint!(sel == cv.y));
 
-            // Modulo decomposition: t[i] = II*k[i] + sum_{m, tt} tt * a[tt][m].
+            // Modulo decomposition: t = II*k + sum_{m, tt} tt * a[tt][m].
             let mut decomp = Expression::from(0);
-            for m in cls_lo..cls_hi {
+            for j in 0..class.nodes.len() {
+                let nv = &node_vars[&(class.id, j)];
                 for tt in 0..ii {
-                    decomp += (tt as i32) * a[tt][m];
+                    decomp += (tt as i32) * nv.a[tt];
                 }
             }
-            model.add_constraint(constraint!(t[i] == (ii as i32) * k[i] + decomp));
+            model.add_constraint(constraint!(cv.t == (ii as i32) * cv.k + decomp));
 
-            // Makespan: t[i] + cost(chosen) <= last. At most one x[m] is 1 per active class.
-            let cost_term: Expression = (cls_lo..cls_hi).map(|m| node_cost[m] * x[m]).sum();
-            model.add_constraint(constraint!(t[i] + cost_term <= last_var));
+            // Makespan: t + cost(chosen) <= last. At most one x is 1 per active class.
+            let cost_term: Expression = (0..class.nodes.len())
+                .map(|j| node_cost[&(class.id, j)] * node_vars[&(class.id, j)].x)
+                .sum();
+            model.add_constraint(constraint!(cv.t + cost_term <= last_var));
         }
 
         // Per-e-node constraints.
-        for (i, class) in classes.iter().enumerate() {
+        for class in self.egraph.classes() {
+            let cv = &class_vars[&class.id];
             for (j, node) in class.nodes.iter().enumerate() {
-                let m = node_offset[i] + j;
+                let nv = &node_vars[&(class.id, j)];
 
                 // Slot used iff selected.
-                let slot_sum: Expression = (0..ii).map(|tt| a[tt][m]).sum();
-                model.add_constraint(constraint!(slot_sum == x[m]));
+                let slot_sum: Expression = (0..ii).map(|tt| nv.a[tt]).sum();
+                model.add_constraint(constraint!(slot_sum == nv.x));
 
-                // Child propagation: if e-node m is chosen, every child class must be active.
+                // Child propagation: if e-node is chosen, every child class must be active.
                 for &child in &node.children {
-                    let c_idx = class_idx[&self.egraph.find(child)];
-                    model.add_constraint(constraint!(x[m] - active[c_idx] <= 0));
+                    let child_y = class_vars[&self.egraph.find(child)].y;
+                    model.add_constraint(constraint!(nv.x - child_y <= 0));
                 }
 
-                // Per-edge dep with big-M, gated on x[m].
+                // Per-edge dep with big-M, gated on nv.x.
                 for edge in node.edges() {
-                    let src = class_idx[&self.egraph.find(edge.id)];
+                    let src_t = class_vars[&self.egraph.find(edge.id)].t;
                     let rhs = edge.d - (ii as i32) * edge.delta;
-                    model.add_constraint(constraint!(
-                        t[i] - t[src] + big_m - big_m * x[m] >= rhs
-                    ));
+                    model.add_constraint(constraint!(cv.t - src_t + M - M * nv.x >= rhs));
                 }
             }
         }
 
         // Root forcing.
         for &r in roots {
-            let i = class_idx[&self.egraph.find(r)];
-            model.add_constraint(constraint!(active[i] == 1));
+            let cv = &class_vars[&self.egraph.find(r)];
+            model.add_constraint(constraint!(cv.y == 1));
         }
 
         // Modulo resource constraint, summed per e-node.
         for s in 0..n_resources {
             for tt in 0..ii {
                 let mut load = Expression::from(0);
-                for m in 0..n_nodes {
-                    let mrt = modulo_rt(&node_rt[m], ii, n_resources);
-                    for l in 0..ii {
-                        let coeff = mrt[l][s];
-                        if coeff != 0 {
-                            load += coeff * a[(tt + ii - l) % ii][m];
+                for class in self.egraph.classes() {
+                    for j in 0..class.nodes.len() {
+                        let key = (class.id, j);
+                        let mrt = &node_mrt[&key];
+                        let nv = &node_vars[&key];
+                        for l in 0..ii {
+                            let coeff = mrt[l][s];
+                            if coeff != 0 {
+                                load += coeff * nv.a[(tt + ii - l) % ii];
+                            }
                         }
                     }
                 }
@@ -291,21 +286,24 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
 
         let sol = model.solve().ok()?;
 
-        let class_ids: Vec<Id> = classes.iter().map(|c| c.id).collect();
-        let active_vals: Vec<bool> = (0..n)
-            .map(|i| sol.value(active[i]).round() as i32 != 0)
-            .collect();
-        let start_time: Vec<i32> = (0..n).map(|i| sol.value(t[i]).round() as i32).collect();
-        let mut selected_node: Vec<Option<usize>> = vec![None; n];
-        for i in 0..n {
-            let cls_lo = node_offset[i];
-            let cls_hi = node_offset[i + 1];
-            for (j, m) in (cls_lo..cls_hi).enumerate() {
-                if sol.value(x[m]).round() as i32 == 1 {
-                    selected_node[i] = Some(j);
+        let mut class_ids = Vec::new();
+        let mut active_vals = Vec::new();
+        let mut start_time = Vec::new();
+        let mut selected_node: Vec<Option<usize>> = Vec::new();
+        for class in self.egraph.classes() {
+            let cv = &class_vars[&class.id];
+            class_ids.push(class.id);
+            active_vals.push(sol.value(cv.y).round() as i32 != 0);
+            start_time.push(sol.value(cv.t).round() as i32);
+
+            let mut sel = None;
+            for j in 0..class.nodes.len() {
+                if sol.value(node_vars[&(class.id, j)].x).round() as i32 == 1 {
+                    sel = Some(j);
                     break;
                 }
             }
+            selected_node.push(sel);
         }
         let makespan = sol.value(last_var).round() as i32;
 
@@ -318,6 +316,17 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
             start_time,
         })
     }
+}
+
+struct ClassVars {
+    t: Variable,
+    k: Variable,
+    y: Variable,
+}
+
+struct NodeVars {
+    x: Variable,
+    a: Vec<Variable>,
 }
 
 fn main() {
