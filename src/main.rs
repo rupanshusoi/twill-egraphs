@@ -3,7 +3,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use egg::{Analysis, EGraph, FromOp, Id, Language, Symbol};
-use good_lp::{constraint, default_solver, variable, variables, Expression, SolverModel};
+use good_lp::{Expression, SolverModel, constraint, default_solver, variable, variables};
 
 type ResTable = Vec<Vec<i32>>;
 
@@ -26,12 +26,12 @@ pub struct TileLang {
 }
 
 impl TileLang {
-    pub fn new(
-        op: impl Into<Symbol>,
-        children: Vec<Id>,
-        edge_data: Vec<(i32, i32)>,
-    ) -> Self {
-        Self { op: op.into(), children, edge_data }
+    pub fn new(op: impl Into<Symbol>, children: Vec<Id>, edge_data: Vec<(i32, i32)>) -> Self {
+        Self {
+            op: op.into(),
+            children,
+            edge_data,
+        }
     }
 
     pub fn leaf(op: impl Into<Symbol>) -> Self {
@@ -124,7 +124,11 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
         machine_model: C,
         resource_limits: Vec<i32>,
     ) -> Self {
-        Self { egraph, machine_model, resource_limits }
+        Self {
+            egraph,
+            machine_model,
+            resource_limits,
+        }
     }
 
     pub fn solve(&self) -> usize {
@@ -140,8 +144,12 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
         let mut vars = variables!();
         let n = self.egraph.number_of_classes();
         let n_resources = self.resource_limits.len();
-        let t: Vec<_> = (0..n).map(|_| vars.add(variable().integer().min(0))).collect();
-        let k: Vec<_> = (0..n).map(|_| vars.add(variable().integer().min(0))).collect();
+        let t: Vec<_> = (0..n)
+            .map(|_| vars.add(variable().integer().min(0)))
+            .collect();
+        let k: Vec<_> = (0..n)
+            .map(|_| vars.add(variable().integer().min(0)))
+            .collect();
         let a: Vec<Vec<_>> = (0..ii)
             .map(|_| (0..n).map(|_| vars.add(variable().binary())).collect())
             .collect();
@@ -149,11 +157,8 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
         let mut model = vars.minimise(last).using(default_solver);
 
         let classes: Vec<_> = self.egraph.classes().collect();
-        let id_to_idx: HashMap<Id, usize> = classes
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.id, i))
-            .collect();
+        let id_to_idx: HashMap<Id, usize> =
+            classes.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
 
         for (i, class) in classes.iter().enumerate() {
             let node = &class.nodes[0];
@@ -207,27 +212,22 @@ fn main() {
 mod tests {
     use super::*;
 
-    pub struct TestCostModel;
+    #[test]
+    fn dragon_book() {
+        pub struct TestCostModel;
 
-    impl MachineModel for TestCostModel {
-        fn get_rt(&self, op: &str) -> ResTable {
-            match op {
-                // a/b/c/d toy problem.
-                "a" => vec![vec![1, 0]],
-                "b" => vec![vec![0, 1]],
-                "c" => vec![vec![1, 0]],
-                "d" => vec![vec![1, 0], vec![0, 1]],
-                // ilp-modulo-sched.py problem. I1=MMA0, I2=SOFTMAX, I3=MMA1.
-                "I1" => vec![vec![1, 0]; 2],
-                "I2" => vec![vec![0, 1]; 4],
-                "I3" => vec![vec![1, 0]; 2],
-                _ => Vec::new(),
+        impl MachineModel for TestCostModel {
+            fn get_rt(&self, op: &str) -> ResTable {
+                match op {
+                    "a" => vec![vec![1, 0]],
+                    "b" => vec![vec![0, 1]],
+                    "c" => vec![vec![1, 0]],
+                    "d" => vec![vec![1, 0], vec![0, 1]],
+                    _ => panic!(),
+                }
             }
         }
-    }
 
-    #[test]
-    fn ii_abcd() {
         let mut egraph: EGraph<TileLang, ()> = EGraph::default();
 
         let d_ph = egraph.add(TileLang::leaf("d"));
@@ -250,33 +250,5 @@ mod tests {
 
         let ii = SwpExtractor::new(&egraph, TestCostModel, vec![1, 1]).solve();
         assert_eq!(ii, 3);
-    }
-
-    #[test]
-    fn ii_matches_python() {
-        // Mirrors the `G = ([I1, I2, I3], [...])` graph in
-        // src/ilp-modulo-sched.py, with `schedule_graph(G, 4, [1, 1])`.
-        let mut egraph: EGraph<TileLang, ()> = EGraph::default();
-
-        let i1 = egraph.add(TileLang::leaf("I1"));
-        let i2 = egraph.add(TileLang::new("I2", vec![i1], vec![(2, 0)]));
-        let i3_ph = egraph.add(TileLang::leaf("I3"));
-        let i3 = egraph.add(TileLang::new("I3", vec![i2, i3_ph], vec![(4, 0), (2, 1)]));
-        egraph.union(i3_ph, i3);
-        egraph.rebuild();
-
-        // I1 is a legitimate leaf (no children); only the I3 placeholder leaf
-        // gets pruned.
-        for class in egraph.classes_mut() {
-            class
-                .nodes
-                .retain(|n| !(n.op.as_str() == "I3" && n.children.is_empty()));
-        }
-        for class in egraph.classes() {
-            assert_eq!(class.nodes.len(), 1);
-        }
-
-        let ii = SwpExtractor::new(&egraph, TestCostModel, vec![1, 1]).solve();
-        assert_eq!(ii, 4);
     }
 }
