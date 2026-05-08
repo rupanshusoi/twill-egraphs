@@ -137,20 +137,65 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
     }
 
     fn solve_at(&self, ii: usize) -> bool {
-      let mut vars = variables!();
-      let n = self.egraph.number_of_classes(); // TODO: Should be num e-nodes
-      let t: Vec<_> = (0..n).map(|_| vars.add(variable().integer().min(0))).collect();
-      let k: Vec<_> = (0..n).map(|_| vars.add(variable().integer().min(0))).collect();
-      let a: Vec<Vec<_>> = (0..ii).map(|_| (0..n).map(|_| vars.add(variable().binary())).collect()).collect()
-      let last = vars.add(variable().integer().min(0));
-      let mut model = vars.minimise(last).using(default_solver);
+        let mut vars = variables!();
+        let n = self.egraph.number_of_classes();
+        let n_resources = self.resource_limits.len();
+        let t: Vec<_> = (0..n).map(|_| vars.add(variable().integer().min(0))).collect();
+        let k: Vec<_> = (0..n).map(|_| vars.add(variable().integer().min(0))).collect();
+        let a: Vec<Vec<_>> = (0..ii)
+            .map(|_| (0..n).map(|_| vars.add(variable().binary())).collect())
+            .collect();
+        let last = vars.add(variable().integer().min(0));
+        let mut model = vars.minimise(last).using(default_solver);
 
-      for i in 0..n {
-        let d = self.machine_model.get_rt(...);
-        model.add_constraint(constraint!(t[i] + d));
-      }
+        let classes: Vec<_> = self.egraph.classes().collect();
+        let id_to_idx: HashMap<Id, usize> = classes
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.id, i))
+            .collect();
 
-      todo!()
+        for (i, class) in classes.iter().enumerate() {
+            let node = &class.nodes[0];
+            let cost = self.machine_model.get_rt(node.op.as_str()).len() as i32;
+
+            model.add_constraint(constraint!(t[i] + cost <= last));
+
+            // An instruction starts at exactly 1 cycle
+            let start: Expression = (0..ii).map(|tt| a[tt][i]).sum();
+            model.add_constraint(constraint!(start == 1));
+
+            // t = k * ii + a
+            let sum: Expression = (0..ii).map(|tt| (tt as i32) * a[tt][i]).sum();
+            model.add_constraint(constraint!(t[i] == (ii as i32) * k[i] + sum));
+
+            // Dependence constraint
+            for edge in node.edges() {
+                let src = id_to_idx[&self.egraph.find(edge.id)];
+                let rhs = edge.d - (ii as i32) * edge.delta;
+                model.add_constraint(constraint!(t[i] - t[src] >= rhs));
+            }
+        }
+
+        // Modulo resource constraint
+        for s in 0..n_resources {
+            for tt in 0..ii {
+                let mut load = Expression::from(0);
+                for (i, class) in classes.iter().enumerate() {
+                    let rt = self.machine_model.get_rt(class.nodes[0].op.as_str());
+                    let mrt = modulo_rt(&rt, ii, n_resources);
+                    for l in 0..ii {
+                        let coeff = mrt[l][s];
+                        if coeff != 0 {
+                            load += coeff * a[(tt + ii - l) % ii][i];
+                        }
+                    }
+                }
+                model.add_constraint(constraint!(load <= self.resource_limits[s]));
+            }
+        }
+
+        model.solve().is_ok()
     }
 }
 
