@@ -3,11 +3,11 @@ import random
 import os
 import re
 import subprocess
-import tempfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUST_BIN = os.path.join(REPO_ROOT, "target", "release", "sme-swp")
 RESULT_RE = re.compile(r"^RESULT_II=(\d+)$", re.MULTILINE)
+TEST_ARTIFACTS_DIR = os.path.join(REPO_ROOT, "test_artifacts")
 
 
 class Node:
@@ -201,19 +201,68 @@ def ensure_rust_binary():
     _rust_built = True
 
 
-def solve_with_rust(path):
+def solve_with_rust(path, dot_out=None):
     ensure_rust_binary()
-    proc = subprocess.run(
-        [RUST_BIN, path],
-        capture_output=True,
-        text=True,
-    )
+    args = [RUST_BIN, path]
+    if dot_out is not None:
+        args.append(dot_out)
+    proc = subprocess.run(args, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"rust solver failed (rc={proc.returncode}):\n{proc.stderr}")
     m = RESULT_RE.search(proc.stdout)
     if not m:
         raise RuntimeError(f"no RESULT_II line in rust output:\n{proc.stdout}")
     return int(m.group(1))
+
+
+def dump_graph_dot(V, E, path):
+    with open(path, "w") as f:
+        f.write("digraph G {\n")
+        for i, v in enumerate(V):
+            f.write(f'  {i}[label = "{v.name}"]\n')
+        for e in E:
+            f.write(f"  {e.dst} -> {e.src}\n")
+        f.write("}\n")
+
+
+def render_dot(dot_path, png_path):
+    subprocess.run(
+        ["dot", "-Tpng", dot_path, "-o", png_path],
+        check=True,
+        capture_output=True,
+    )
+
+
+def merge_side_by_side(left_png, right_png, out_png):
+    subprocess.run(
+        [
+            "magick",
+            "(", left_png, "-gravity", "north", "-splice", "0x40",
+            "-background", "white", "-extent", "0x0", ")",
+            "(", right_png, "-gravity", "north", "-splice", "0x40",
+            "-background", "white", "-extent", "0x0", ")",
+            "+append",
+            out_png,
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def render_comparison(V, E, swp_path, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    rust_dot = os.path.join(out_dir, "rust.dot")
+    py_dot = os.path.join(out_dir, "py.dot")
+    rust_png = os.path.join(out_dir, "rust.png")
+    py_png = os.path.join(out_dir, "py.png")
+    combined = os.path.join(out_dir, "combined.png")
+
+    rs_ii = solve_with_rust(swp_path, dot_out=rust_dot)
+    dump_graph_dot(V, E, py_dot)
+    render_dot(rust_dot, rust_png)
+    render_dot(py_dot, py_png)
+    merge_side_by_side(rust_png, py_png, combined)
+    return rs_ii, combined
 
 
 def run_test(seed, max_ii=32, **kwargs):
@@ -241,13 +290,11 @@ def run_test(seed, max_ii=32, **kwargs):
 
     failures = validate_schedule((V, E), py_ii, R, T_vals)
 
-    with tempfile.NamedTemporaryFile("w", suffix=".swp", delete=False) as tmp:
-        tmp_path = tmp.name
-    try:
-        dump_problem(V, E, R, tmp_path)
-        rs_ii = solve_with_rust(tmp_path)
-    finally:
-        os.unlink(tmp_path)
+    out_dir = os.path.join(TEST_ARTIFACTS_DIR, f"seed_{seed:04d}")
+    os.makedirs(out_dir, exist_ok=True)
+    swp_path = os.path.join(out_dir, "problem.swp")
+    dump_problem(V, E, R, swp_path)
+    rs_ii, combined_png = render_comparison(V, E, swp_path, out_dir)
 
     return {
         "seed": seed,

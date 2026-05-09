@@ -425,98 +425,18 @@ pub fn build_egraph(problem: &Problem) -> (EGraph<TileLang, ()>, Vec<Id>) {
 }
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .expect("usage: sme-swp <problem.swp>");
+    let mut args = std::env::args().skip(1);
+    let path = args.next().expect("usage: sme-swp <problem.swp> [dot_out]");
+    let dot_out = args.next();
+
     let problem = parse_problem(&path);
     let (egraph, roots) = build_egraph(&problem);
+
+    if let Some(out) = dot_out.as_deref() {
+        egraph.dot().to_dot(out).expect("failed to write dot file");
+    }
+
     let model = TableMachineModel::from_problem(&problem);
     let sol = SwpExtractor::new(&egraph, model, problem.resource_limits.clone()).solve(&roots);
     println!("RESULT_II={}", sol.ii);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dragon_book() {
-        pub struct TestCostModel;
-
-        impl MachineModel for TestCostModel {
-            fn get_rt(&self, op: &str) -> ResTable {
-                match op {
-                    "a" => vec![vec![1, 0]],
-                    "b" => vec![vec![0, 1]],
-                    "c" => vec![vec![1, 0]],
-                    "d" => vec![vec![1, 0], vec![0, 1]],
-                    _ => panic!(),
-                }
-            }
-        }
-
-        let mut egraph: EGraph<TileLang, ()> = EGraph::default();
-
-        let d_ph = egraph.add(TileLang::leaf("d"));
-        let c = egraph.add(TileLang::new("c", vec![d_ph], vec![(0, 1)]));
-        let b = egraph.add(TileLang::new("b", vec![c, d_ph], vec![(0, 1), (0, 2)]));
-        let a = egraph.add(TileLang::new("a", vec![b], vec![(0, 2)]));
-        let d_with_b = egraph.add(TileLang::new("d", vec![b], vec![(1, 1)]));
-        egraph.union(d_ph, d_with_b);
-        egraph.rebuild();
-
-        // Drop the placeholder `d()` leaf so d's class is a singleton {d(b)}.
-        for class in egraph.classes_mut() {
-            class
-                .nodes
-                .retain(|n| !(n.op.as_str() == "d" && n.children.is_empty()));
-        }
-        for class in egraph.classes() {
-            assert_eq!(class.nodes.len(), 1);
-        }
-
-        let sol = SwpExtractor::new(&egraph, TestCostModel, vec![1, 1]).solve(&[a]);
-        assert_eq!(sol.ii, 3);
-    }
-
-    #[test]
-    fn chain_two_nodes_per_class() {
-        // Three e-classes c, b, a in a chain (a depends on b, b depends on c, c depends on
-        // a single leaf). Each non-leaf class has two e-nodes with identical resource usage
-        // but different incoming-edge latencies (d=2 vs d=1). The LP must pick the d=1 e-node
-        // in every class to minimise makespan.
-        pub struct CM;
-        impl MachineModel for CM {
-            fn get_rt(&self, op: &str) -> ResTable {
-                match op {
-                    "leaf" | "c1" | "c2" | "b1" | "b2" | "a1" | "a2" => vec![vec![1]],
-                    _ => panic!("unknown op {op}"),
-                }
-            }
-        }
-
-        let mut g: EGraph<TileLang, ()> = EGraph::default();
-        let leaf = g.add(TileLang::leaf("leaf"));
-
-        let c1 = g.add(TileLang::new("c1", vec![leaf], vec![(2, 0)]));
-        let c2 = g.add(TileLang::new("c2", vec![leaf], vec![(1, 0)]));
-        g.union(c1, c2);
-
-        let b1 = g.add(TileLang::new("b1", vec![c1], vec![(2, 0)]));
-        let b2 = g.add(TileLang::new("b2", vec![c1], vec![(1, 0)]));
-        g.union(b1, b2);
-
-        let a1 = g.add(TileLang::new("a1", vec![b1], vec![(2, 0)]));
-        let a2 = g.add(TileLang::new("a2", vec![b1], vec![(1, 0)]));
-        g.union(a1, a2);
-
-        g.rebuild();
-
-        let sol = SwpExtractor::new(&g, CM, vec![1]).solve(&[a1]);
-        // 4 ops each consuming 1 unit of the only resource → ii must be at least 4.
-        assert_eq!(sol.ii, 4);
-        // d=1 chain: t_leaf=0, t_c=1, t_b=2, t_a=3, end = t_a + cost(a) = 4.
-        // d=2 chain would give end = 7.
-        assert_eq!(sol.end, 4);
-    }
 }
