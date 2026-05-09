@@ -1,5 +1,13 @@
 from pulp import *
 import random
+import os
+import re
+import subprocess
+import tempfile
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUST_BIN = os.path.join(REPO_ROOT, "target", "release", "sme-swp")
+RESULT_RE = re.compile(r"^RESULT_II=(\d+)$", re.MULTILINE)
 
 
 class Node:
@@ -167,27 +175,90 @@ def validate_schedule(G, II, R, T_vals):
     return failures
 
 
-def run_test(seed, **kwargs):
+def dump_problem(V, E, R, path):
+    with open(path, "w") as f:
+        f.write(f"R {len(R)} {' '.join(str(r) for r in R)}\n")
+        f.write(f"N {len(V)}\n")
+        for v in V:
+            f.write(f"{v.name} {v.cost()} {v.resource()}\n")
+        f.write(f"E {len(E)}\n")
+        for e in E:
+            f.write(f"{e.src} {e.dst} {e.dep[0]} {e.dep[1]}\n")
+
+
+_rust_built = False
+
+
+def ensure_rust_binary():
+    global _rust_built
+    if _rust_built:
+        return
+    subprocess.run(
+        ["cargo", "build", "--release", "--quiet"],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    _rust_built = True
+
+
+def solve_with_rust(path):
+    ensure_rust_binary()
+    proc = subprocess.run(
+        [RUST_BIN, path],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"rust solver failed (rc={proc.returncode}):\n{proc.stderr}")
+    m = RESULT_RE.search(proc.stdout)
+    if not m:
+        raise RuntimeError(f"no RESULT_II line in rust output:\n{proc.stdout}")
+    return int(m.group(1))
+
+
+def run_test(seed, max_ii=32, **kwargs):
     gen = RandomGraphGenerator(seed=seed, **kwargs)
     V, E = gen.generate()
     R = gen.resource_limits(V)
 
-    II_min = max(1, max((v.cost() for v in V), default=1))
-    for II in range(II_min, II_min + 8):
+    py_ii, T_vals = None, None
+    for II in range(1, max_ii + 1):
         T_vals = schedule_graph((V, E), II, R)
-        if T_vals is None:
-            continue
-        failures = validate_schedule((V, E), II, R, T_vals)
+        if T_vals is not None:
+            py_ii = II
+            break
+
+    if py_ii is None:
         return {
             "seed": seed,
             "num_nodes": len(V),
             "num_edges": len(E),
-            "II": II,
+            "py_ii": None,
+            "rs_ii": None,
             "R": R,
-            "T": T_vals,
-            "failures": failures,
+            "failures": [],
         }
-    return {"seed": seed, "num_nodes": len(V), "num_edges": len(E), "II": None, "failures": []}
+
+    failures = validate_schedule((V, E), py_ii, R, T_vals)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".swp", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        dump_problem(V, E, R, tmp_path)
+        rs_ii = solve_with_rust(tmp_path)
+    finally:
+        os.unlink(tmp_path)
+
+    return {
+        "seed": seed,
+        "num_nodes": len(V),
+        "num_edges": len(E),
+        "py_ii": py_ii,
+        "rs_ii": rs_ii,
+        "R": R,
+        "T": T_vals,
+        "failures": failures,
+    }
 
 
 if __name__ == "__main__":
@@ -197,6 +268,7 @@ if __name__ == "__main__":
     base_seed = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 
     total_failures = 0
+    total_mismatches = 0
     for trial in range(num_trials):
         seed = base_seed + trial
         result = run_test(
@@ -206,16 +278,29 @@ if __name__ == "__main__":
             edge_density=0.3,
             backedge_prob=0.15,
         )
-        ok = result["II"] is not None and not result["failures"]
-        status = "OK" if ok else ("UNSCHEDULABLE" if result["II"] is None else "FAIL")
+        py_ii = result["py_ii"]
+        rs_ii = result["rs_ii"]
+
+        if py_ii is None:
+            status = "UNSCHEDULABLE"
+        elif result["failures"]:
+            status = "FAIL"
+            total_failures += 1
+        elif py_ii != rs_ii:
+            status = "II MISMATCH"
+            total_mismatches += 1
+        else:
+            status = "OK"
+
         print(
             f"[trial {trial:3d} seed={result['seed']:3d}] "
             f"V={result['num_nodes']} E={result['num_edges']} "
-            f"II={result['II']} R={result.get('R')} -> {status}"
+            f"II_py={py_ii} II_rs={rs_ii} R={result.get('R')} -> {status}"
         )
-        if result["failures"]:
-            total_failures += 1
-            for f in result["failures"]:
-                print(f"  FAIL: {f}")
+        for f in result["failures"]:
+            print(f"  FAIL: {f}")
 
-    print(f"\nTotal validation failures: {total_failures}/{num_trials}")
+    print(
+        f"\nValidation failures: {total_failures}/{num_trials}, "
+        f"II mismatches: {total_mismatches}/{num_trials}"
+    )
