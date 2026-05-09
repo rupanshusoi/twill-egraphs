@@ -165,11 +165,11 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
 
     fn solve_at(&self, ii: usize, roots: &[Id]) -> Option<SwpSolution> {
         let n_resources = self.resource_limits.len();
+        // TODO: Set M properly
         const M: i32 = 1000;
 
         let mut vars = variables!();
 
-        // Per-e-class LP variables.
         let mut class_vars: HashMap<Id, ClassVars> = HashMap::new();
         for class in self.egraph.classes() {
             class_vars.insert(
@@ -182,7 +182,6 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
             );
         }
 
-        // Per-e-node LP variables and pre-computed cost / folded resource table.
         let mut node_vars: HashMap<(Id, usize), NodeVars> = HashMap::new();
         let mut node_cost: HashMap<(Id, usize), i32> = HashMap::new();
         let mut node_mrt: HashMap<(Id, usize), ResTable> = HashMap::new();
@@ -202,53 +201,55 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
             }
         }
 
-        let last_var = vars.add(variable().integer().min(0));
-        let mut model = vars.minimise(last_var).using(default_solver);
+        let last = vars.add(variable().integer().min(0));
+        let mut model = vars.minimise(last).using(default_solver);
 
-        // Per-class constraints.
+        // E-class constraints
         for class in self.egraph.classes() {
             let cv = &class_vars[&class.id];
 
-            // Selection: exactly one e-node per active class, none when inactive.
-            let sel: Expression = (0..class.nodes.len())
+            // E-class selected <=> One e-node selected
+            let sum: Expression = (0..class.nodes.len())
                 .map(|j| node_vars[&(class.id, j)].x)
                 .sum();
-            model.add_constraint(constraint!(sel == cv.y));
+            model.add_constraint(constraint!(sum == cv.y));
 
-            // Modulo decomposition: t = II*k + sum_{m, tt} tt * a[tt][m].
-            let mut decomp = Expression::from(0);
+            // t = k * I + \sum_i i * a_i
+            let mut ia = Expression::from(0);
             for j in 0..class.nodes.len() {
                 let nv = &node_vars[&(class.id, j)];
                 for tt in 0..ii {
-                    decomp += (tt as i32) * nv.a[tt];
+                    ia += (tt as i32) * nv.a[tt];
                 }
             }
-            model.add_constraint(constraint!(cv.t == (ii as i32) * cv.k + decomp));
+            model.add_constraint(constraint!(cv.t == cv.k * (ii as i32) + ia));
 
-            // Makespan: t + cost(chosen) <= last. At most one x is 1 per active class.
-            let cost_term: Expression = (0..class.nodes.len())
+            // Definition of objective
+            let end: Expression = (0..class.nodes.len())
                 .map(|j| node_cost[&(class.id, j)] * node_vars[&(class.id, j)].x)
                 .sum();
-            model.add_constraint(constraint!(cv.t + cost_term <= last_var));
+            model.add_constraint(constraint!(last >= cv.t + end));
         }
 
-        // Per-e-node constraints.
+        // E-node constraints
         for class in self.egraph.classes() {
             let cv = &class_vars[&class.id];
             for (j, node) in class.nodes.iter().enumerate() {
                 let nv = &node_vars[&(class.id, j)];
 
-                // Slot used iff selected.
+                // sum_i a_i <=> x
                 let slot_sum: Expression = (0..ii).map(|tt| nv.a[tt]).sum();
                 model.add_constraint(constraint!(slot_sum == nv.x));
 
-                // Child propagation: if e-node is chosen, every child class must be active.
+                // E-node selected => every child e-class selected
                 for &child in &node.children {
                     let child_y = class_vars[&self.egraph.find(child)].y;
                     model.add_constraint(constraint!(nv.x - child_y <= 0));
                 }
 
-                // Per-edge dep with big-M, gated on nv.x.
+                // Modulo scheduling dependence constraint
+                // TODO: Can't we merge the previous loop and this one?
+                // FIXME: If I find a better e-node in a child e-class, its d will not change...
                 for edge in node.edges() {
                     let src_t = class_vars[&self.egraph.find(edge.id)].t;
                     let rhs = edge.d - (ii as i32) * edge.delta;
@@ -257,30 +258,26 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
             }
         }
 
-        // Root forcing.
         for &r in roots {
             let cv = &class_vars[&self.egraph.find(r)];
             model.add_constraint(constraint!(cv.y == 1));
         }
 
-        // Modulo resource constraint, summed per e-node.
+        // Resource constraints
         for s in 0..n_resources {
             for tt in 0..ii {
-                let mut load = Expression::from(0);
+                let mut usage = Expression::from(0);
                 for class in self.egraph.classes() {
                     for j in 0..class.nodes.len() {
                         let key = (class.id, j);
                         let mrt = &node_mrt[&key];
                         let nv = &node_vars[&key];
-                        for l in 0..ii {
-                            let coeff = mrt[l][s];
-                            if coeff != 0 {
-                                load += coeff * nv.a[(tt + ii - l) % ii];
-                            }
+                        for i in 0..ii {
+                            usage += mrt[(tt + ii - i) % ii][s] * nv.a[i];
                         }
                     }
                 }
-                model.add_constraint(constraint!(load <= self.resource_limits[s]));
+                model.add_constraint(constraint!(usage <= self.resource_limits[s]));
             }
         }
 
@@ -305,7 +302,7 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
             }
             selected_node.push(sel);
         }
-        let makespan = sol.value(last_var).round() as i32;
+        let makespan = sol.value(last).round() as i32;
 
         Some(SwpSolution {
             ii,
