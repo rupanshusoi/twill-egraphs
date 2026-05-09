@@ -114,31 +114,28 @@ impl FromOp for TileLang {
     }
 }
 
+struct ClassVars {
+    t: Variable,
+    k: Variable,
+    y: Variable,
+}
+
+struct NodeVars {
+    x: Variable,
+    a: Vec<Variable>,
+}
+
 pub struct SwpExtractor<'a, N: Analysis<TileLang>, C: MachineModel> {
     egraph: &'a EGraph<TileLang, N>,
     machine_model: C,
     resource_limits: Vec<i32>,
 }
 
-#[derive(Debug, Clone)]
 pub struct SwpSolution {
     pub ii: usize,
-    pub makespan: i32,
-    /// Canonical e-class IDs, indexed in the same order used by the other vectors.
-    pub class_ids: Vec<Id>,
-    /// Whether each e-class is selected on the chosen DAG.
-    pub active: Vec<bool>,
-    /// For each e-class, the index (within `EClass::nodes`) of the chosen e-node, or `None`
-    /// if the class is inactive.
-    pub selected_node: Vec<Option<usize>>,
-    /// Absolute start time of each e-class (only meaningful when `active[i]`).
-    pub start_time: Vec<i32>,
-}
-
-impl SwpSolution {
-    pub fn class_index(&self, id: Id) -> Option<usize> {
-        self.class_ids.iter().position(|&c| c == id)
-    }
+    pub end: usize,
+    // Selected e-classes -> (index of e-node, t)
+    pub selected: HashMap<Id, (usize, i32)>,
 }
 
 impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
@@ -283,47 +280,24 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
 
         let sol = model.solve().ok()?;
 
-        let mut class_ids = Vec::new();
-        let mut active_vals = Vec::new();
-        let mut start_time = Vec::new();
-        let mut selected_node: Vec<Option<usize>> = Vec::new();
+        let mut selected: HashMap<Id, (usize, i32)> = HashMap::new();
         for class in self.egraph.classes() {
             let cv = &class_vars[&class.id];
-            class_ids.push(class.id);
-            active_vals.push(sol.value(cv.y).round() as i32 != 0);
-            start_time.push(sol.value(cv.t).round() as i32);
-
-            let mut sel = None;
+            if sol.value(cv.y).round() as i32 == 0 {
+                continue;
+            }
+            let t = sol.value(cv.t).round() as i32;
             for j in 0..class.nodes.len() {
                 if sol.value(node_vars[&(class.id, j)].x).round() as i32 == 1 {
-                    sel = Some(j);
+                    selected.insert(class.id, (j, t));
                     break;
                 }
             }
-            selected_node.push(sel);
         }
-        let makespan = sol.value(last).round() as i32;
+        let end = sol.value(last).round() as usize;
 
-        Some(SwpSolution {
-            ii,
-            makespan,
-            class_ids,
-            active: active_vals,
-            selected_node,
-            start_time,
-        })
+        Some(SwpSolution { ii, end, selected })
     }
-}
-
-struct ClassVars {
-    t: Variable,
-    k: Variable,
-    y: Variable,
-}
-
-struct NodeVars {
-    x: Variable,
-    a: Vec<Variable>,
 }
 
 fn main() {
@@ -410,9 +384,9 @@ mod tests {
         let sol = SwpExtractor::new(&g, CM, vec![1]).solve(&[a1]);
         // 4 ops each consuming 1 unit of the only resource → ii must be at least 4.
         assert_eq!(sol.ii, 4);
-        // d=1 chain: t_leaf=0, t_c=1, t_b=2, t_a=3, makespan = t_a + cost(a) = 4.
-        // d=2 chain would give makespan = 7.
-        assert_eq!(sol.makespan, 4);
+        // d=1 chain: t_leaf=0, t_c=1, t_b=2, t_a=3, end = t_a + cost(a) = 4.
+        // d=2 chain would give end = 7.
+        assert_eq!(sol.end, 4);
     }
 
     #[test]
@@ -443,14 +417,9 @@ mod tests {
         let sol = SwpExtractor::new(&g, CM, vec![1]).solve(&[a1]);
         assert_eq!(sol.ii, 2);
 
-        let p_idx = sol.class_index(g.find(p)).unwrap();
-        let q_idx = sol.class_index(g.find(q)).unwrap();
-        let r_idx = sol.class_index(g.find(r)).unwrap();
-        let a_idx = sol.class_index(g.find(a1)).unwrap();
-
-        assert!(!sol.active[p_idx], "p should be inactive when a(r) is picked");
-        assert!(!sol.active[q_idx], "q should be inactive when a(r) is picked");
-        assert!(sol.active[r_idx], "r must be active when a(r) is picked");
-        assert!(sol.active[a_idx], "root a must be active");
+        assert!(!sol.selected.contains_key(&g.find(p)), "p should be inactive when a(r) is picked");
+        assert!(!sol.selected.contains_key(&g.find(q)), "q should be inactive when a(r) is picked");
+        assert!(sol.selected.contains_key(&g.find(r)), "r must be active when a(r) is picked");
+        assert!(sol.selected.contains_key(&g.find(a1)), "root a must be active");
     }
 }
