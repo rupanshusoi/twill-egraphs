@@ -7,7 +7,9 @@ use good_lp::{
     Expression, Solution, SolverModel, Variable, constraint, default_solver, variable, variables,
 };
 
-type ResTable = Vec<Vec<i32>>;
+mod visualize;
+
+pub type ResTable = Vec<Vec<i32>>;
 
 pub trait MachineModel {
     fn get_rt(&self, op: &str) -> ResTable;
@@ -131,6 +133,7 @@ pub struct SwpExtractor<'a, N: Analysis<TileLang>, C: MachineModel> {
     resource_limits: Vec<i32>,
 }
 
+#[derive(Debug)]
 pub struct SwpSolution {
     pub ii: usize,
     pub end: usize,
@@ -352,8 +355,9 @@ pub fn parse_problem(path: &str) -> Problem {
     }
 }
 
+#[derive(Clone)]
 pub struct TableMachineModel {
-    table: HashMap<String, ResTable>,
+    pub table: HashMap<String, ResTable>,
 }
 
 impl TableMachineModel {
@@ -380,12 +384,38 @@ impl MachineModel for TableMachineModel {
     }
 }
 
+pub fn add_phantom(egraph: &mut EGraph<TileLang, ()>, tag: &str) -> Id {
+    egraph.add(TileLang::leaf(format!("__phantom_{tag}")))
+}
+
+pub fn strip_phantoms(egraph: &mut EGraph<TileLang, ()>) {
+    egraph.rebuild();
+    for class in egraph.classes_mut() {
+        class
+            .nodes
+            .retain(|node| !node.op.as_str().starts_with("__phantom_"));
+    }
+}
+
+pub fn add_cyclic(
+    egraph: &mut EGraph<TileLang, ()>,
+    op: &str,
+    children: Vec<Option<Id>>,
+    edge_data: Vec<(i32, i32)>,
+) -> Id {
+    let phantom = add_phantom(egraph, op);
+    let resolved: Vec<Id> = children.iter().map(|c| c.unwrap_or(phantom)).collect();
+    let real = egraph.add(TileLang::new(op, resolved, edge_data));
+    egraph.union(phantom, real);
+    real
+}
+
 pub fn build_egraph(problem: &Problem) -> (EGraph<TileLang, ()>, Vec<Id>) {
     let n = problem.nodes.len();
     let mut egraph: EGraph<TileLang, ()> = EGraph::default();
 
     let phantom: Vec<Id> = (0..n)
-        .map(|i| egraph.add(TileLang::leaf(format!("__phantom_{i}"))))
+        .map(|i| add_phantom(&mut egraph, &i.to_string()))
         .collect();
 
     let mut incoming: Vec<Vec<(usize, i32, i32)>> = vec![Vec::new(); n];
@@ -409,17 +439,13 @@ pub fn build_egraph(problem: &Problem) -> (EGraph<TileLang, ()>, Vec<Id>) {
     for v in 0..n {
         egraph.union(phantom[v], real[v]);
     }
-    egraph.rebuild();
-
-    for class in egraph.classes_mut() {
-        class
-            .nodes
-            .retain(|node| !node.op.as_str().starts_with("__phantom_"));
-    }
+    strip_phantoms(&mut egraph);
 
     // All e-classes singleton
     assert_eq!(egraph.number_of_classes(), egraph.total_number_of_nodes());
 
+    // NOTE: To match Python, we force all e-classes! For a real program, there
+    // should a single e-class, corresponding to the output value, that is forced.
     let roots: Vec<Id> = real.iter().map(|&id| egraph.find(id)).collect();
     (egraph, roots)
 }
@@ -439,4 +465,60 @@ fn main() {
     let model = TableMachineModel::from_problem(&problem);
     let sol = SwpExtractor::new(&egraph, model, problem.resource_limits.clone()).solve(&roots);
     println!("RESULT_II={}", sol.ii);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fa() {
+        // for ... { k = load; v = load; s = matmul(q, k); p = softmax(s); o += matmul(v, p) }
+        let mut egraph: EGraph<TileLang, ()> = EGraph::default();
+
+        let q = egraph.add(TileLang::leaf("q"));
+        let k = egraph.add(TileLang::new("k", vec![], vec![]));
+        let v = egraph.add(TileLang::new("v", vec![], vec![]));
+        let s = egraph.add(TileLang::new("s", vec![q, k], vec![(0, 0), (1, 0)]));
+        let p = egraph.add(TileLang::new("p", vec![s], vec![(1, 0)]));
+
+        let o = add_cyclic(
+            &mut egraph,
+            "o",
+            vec![None, Some(v), Some(p)],
+            vec![(1, 1), (1, 0), (2, 0)],
+        );
+        strip_phantoms(&mut egraph);
+
+        let root = egraph.find(o);
+
+        // Resources: [TMA, SIMT, TC]
+        let mut table: HashMap<String, ResTable> = HashMap::new();
+        table.insert("q".into(), vec![]);
+        table.insert("k".into(), vec![vec![1, 0, 0]]);
+        table.insert("v".into(), vec![vec![1, 0, 0]]);
+        table.insert("s".into(), vec![vec![0, 0, 1]]);
+        table.insert("p".into(), vec![vec![0, 1, 0], vec![0, 1, 0]]);
+        table.insert("o".into(), vec![vec![0, 0, 1]]);
+        let model = TableMachineModel { table };
+        let resource_limits = vec![1, 1, 1];
+
+        // egraph
+        //     .dot()
+        //     .to_dot("flash_attention.dot")
+        //     .expect("failed to write dot");
+        // let _ = egraph.dot().to_png("flash_attention.png");
+
+        let sol = SwpExtractor::new(&egraph, model.clone(), resource_limits.clone()).solve(&[root]);
+        println!("ii = {}", sol.ii);
+
+        visualize::render_pipeline(
+            &egraph,
+            &model,
+            &resource_limits,
+            &sol,
+            "fa.svg",
+        )
+        .expect("failed to render pipeline diagram");
+    }
 }
