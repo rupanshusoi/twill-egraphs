@@ -10,6 +10,7 @@ use good_lp::{
 mod visualize;
 
 pub type ResourceTable = Vec<Vec<i32>>;
+pub type ResourceLimit = Vec<i32>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct EdgeData<T> {
@@ -135,7 +136,7 @@ struct NodeVars {
 
 pub struct SwpExtractor<'a, N: Analysis<TileLang>> {
     egraph: &'a EGraph<TileLang, N>,
-    resource_limits: Vec<i32>,
+    resource_limits: &'a ResourceLimit,
 }
 
 #[derive(Debug)]
@@ -147,7 +148,7 @@ pub struct SwpSolution {
 }
 
 impl<'a, N: Analysis<TileLang>> SwpExtractor<'a, N> {
-    pub fn new(egraph: &'a EGraph<TileLang, N>, resource_limits: Vec<i32>) -> Self {
+    pub fn new(egraph: &'a EGraph<TileLang, N>, resource_limits: &'a ResourceLimit) -> Self {
         Self {
             egraph,
             resource_limits,
@@ -307,6 +308,7 @@ struct DepGraph<'a> {
     nodes: HashSet<&'a str>,
     rts: HashMap<&'a str, ResourceTable>,
     edges: HashMap<&'a str, Vec<EdgeData<&'a str>>>,
+    resource_limits: ResourceLimit,
 }
 
 impl<'a> DepGraph<'a> {
@@ -314,12 +316,13 @@ impl<'a> DepGraph<'a> {
         nodes: Vec<&'a str>,
         rts: HashMap<&'a str, ResourceTable>,
         edges: HashMap<&'a str, Vec<EdgeData<&'a str>>>,
+        resource_limits: ResourceLimit,
     ) -> Self {
         let mut set = HashSet::with_capacity(nodes.len());
         for n in &nodes {
             assert!(set.insert(*n), "duplicate node name: {n}");
         }
-        Self { nodes: set, rts, edges }
+        Self { nodes: set, rts, edges, resource_limits }
     }
 
     fn class_of<N: Analysis<TileLang>>(&self, egraph: &EGraph<TileLang, N>, op: &str) -> Id {
@@ -401,15 +404,14 @@ mod tests {
             ),
         ]);
 
-        let dep = DepGraph::new(nodes, rts, edges);
+        let dep = DepGraph::new(nodes, rts, edges, vec![1, 1, 1]);
         let egraph = dep.to_egraph();
-        let resource_limits = vec![1, 1, 1];
 
         let root = dep.class_of(&egraph, "o");
-        let sol = SwpExtractor::new(&egraph, resource_limits.clone()).solve(&[root]);
+        let sol = SwpExtractor::new(&egraph, &dep.resource_limits).solve(&[root]);
         println!("ii = {}", sol.ii);
 
-        visualize::render_pipeline(&egraph, &resource_limits, &sol, "fa.svg")
+        visualize::render_pipeline(&egraph, &dep.resource_limits, &sol, "fa.svg")
             .expect("failed to render pipeline diagram");
     }
 
@@ -426,17 +428,18 @@ mod tests {
             ("c", vec![EdgeData { id: "b", d: 1, delta: 0 }]),
         ]);
 
-        let dep = DepGraph::new(nodes, rts, edges);
+        let dep = DepGraph::new(nodes, rts, edges, vec![1]);
         let egraph = dep.to_egraph();
-        let limits = vec![1];
 
-        let sol = SwpExtractor::new(&egraph, limits.clone()).solve(&[dep.class_of(&egraph, "c")]);
+        let sol = SwpExtractor::new(&egraph, &dep.resource_limits)
+            .solve(&[dep.class_of(&egraph, "c")]);
         assert_eq!(sol.ii, 3);
 
         let rule: Rewrite<TileLang, ()> = rewrite!("ax"; "(b ?x)" => "(x y)");
         let egraph = Runner::default().with_egraph(egraph).run(&[rule]).egraph;
 
-        let sol = SwpExtractor::new(&egraph, limits).solve(&[dep.class_of(&egraph, "c")]);
+        let sol = SwpExtractor::new(&egraph, &dep.resource_limits)
+            .solve(&[dep.class_of(&egraph, "c")]);
         assert!(!sol.selected.contains_key(&dep.class_of(&egraph, "a")));
         assert_eq!(sol.ii, 1);
     }
