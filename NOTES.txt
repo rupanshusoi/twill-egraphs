@@ -1,0 +1,3 @@
+The random testing forces all e-classes. I don't see an alternative approach to writing this test, as the e-graph needs to extract all the nodes present in the Python test. When we run an actual dependence graph from a program, there should only be a single e-class that we force.
+
+Dependence edge a->b is reified as edge from e-node b to e-class of a. Doing so lets us associate a (d, delta) with every edge in both representations.
