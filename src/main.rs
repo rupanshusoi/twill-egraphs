@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use egg::{Analysis, EGraph, FromOp, Id, Language, Symbol};
+use egg::{Analysis, EGraph, FromOp, Id, Language, Rewrite, Runner, Symbol, rewrite};
 use good_lp::{
     Expression, Solution, SolverModel, Variable, constraint, default_solver, variable, variables,
 };
@@ -493,14 +493,14 @@ mod tests {
         let root = egraph.find(o);
 
         // Resources: [TMA, SIMT, TC]
-        let mut table: HashMap<String, ResTable> = HashMap::new();
-        table.insert("q".into(), vec![]);
-        table.insert("k".into(), vec![vec![1, 0, 0]]);
-        table.insert("v".into(), vec![vec![1, 0, 0]]);
-        table.insert("s".into(), vec![vec![0, 0, 1]]);
-        table.insert("p".into(), vec![vec![0, 1, 0], vec![0, 1, 0]]);
-        table.insert("o".into(), vec![vec![0, 0, 1]]);
-        let model = TableMachineModel { table };
+        let mut rt: HashMap<String, ResTable> = HashMap::new();
+        rt.insert("q".into(), vec![]);
+        rt.insert("k".into(), vec![vec![1, 0, 0]]);
+        rt.insert("v".into(), vec![vec![1, 0, 0]]);
+        rt.insert("s".into(), vec![vec![0, 0, 1]]);
+        rt.insert("p".into(), vec![vec![0, 1, 0], vec![0, 1, 0]]);
+        rt.insert("o".into(), vec![vec![0, 0, 1]]);
+        let model = TableMachineModel { rt };
         let resource_limits = vec![1, 1, 1];
 
         // egraph
@@ -520,5 +520,34 @@ mod tests {
             "fa.svg",
         )
         .expect("failed to render pipeline diagram");
+    }
+
+    #[test]
+    fn abc() {
+        let mut egraph: EGraph<TileLang, ()> = EGraph::default();
+        let a = egraph.add(TileLang::leaf("a"));
+        let b = egraph.add(TileLang::new("b", vec![a], vec![(1, 0)]));
+        let c = egraph.add(TileLang::new("c", vec![b], vec![(1, 0)]));
+        egraph.rebuild();
+
+        let mut rt: HashMap<String, ResTable> = HashMap::new();
+        rt.insert("a".into(), vec![vec![1]]);
+        rt.insert("b".into(), vec![vec![1]]);
+        rt.insert("c".into(), vec![vec![1]]);
+        rt.insert("x".into(), vec![]);
+        rt.insert("y".into(), vec![]);
+        let model = TableMachineModel { rt };
+        let limits = vec![1];
+
+        let sol = SwpExtractor::new(&egraph, model.clone(), limits.clone())
+            .solve(&[egraph.find(c)]);
+        assert_eq!(sol.ii, 3);
+
+        let rule: Rewrite<TileLang, ()> = rewrite!("ax"; "(b ?x)" => "(x y)");
+        let egraph = Runner::default().with_egraph(egraph).run(&[rule]).egraph;
+
+        let sol = SwpExtractor::new(&egraph, model, limits).solve(&[egraph.find(c)]);
+        assert!(!sol.selected.contains_key(&egraph.find(a)));
+        assert_eq!(sol.ii, 1);
     }
 }
