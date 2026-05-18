@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
@@ -9,15 +9,11 @@ use good_lp::{
 
 mod visualize;
 
-pub type ResTable = Vec<Vec<i32>>;
-
-pub trait MachineModel {
-    fn get_rt(&self, op: &str) -> ResTable;
-}
+pub type ResourceTable = Vec<Vec<i32>>;
 
 #[derive(Debug, Clone, Copy)]
-pub struct EdgeData {
-    pub id: Id,
+pub struct EdgeData<T> {
+    pub id: T,
     pub d: i32,
     pub delta: i32,
 }
@@ -26,23 +22,33 @@ pub struct EdgeData {
 pub struct TileLang {
     pub op: Symbol,
     pub children: Vec<Id>,
+    // NOTE: This is not EdgeData because it lacks children Ids. We cannot put
+    // those here because the Language trait wants a slice of Ids, so the Ids
+    // must be separate.
     pub edge_data: Vec<(i32, i32)>,
+    pub rt: ResourceTable,
 }
 
 impl TileLang {
-    pub fn new(op: impl Into<Symbol>, children: Vec<Id>, edge_data: Vec<(i32, i32)>) -> Self {
+    pub fn new(
+        op: impl Into<Symbol>,
+        children: Vec<Id>,
+        edge_data: Vec<(i32, i32)>,
+        rt: ResourceTable,
+    ) -> Self {
         Self {
             op: op.into(),
             children,
             edge_data,
+            rt,
         }
     }
 
     pub fn leaf(op: impl Into<Symbol>) -> Self {
-        Self::new(op, vec![], vec![])
+        Self::new(op, vec![], vec![], vec![])
     }
 
-    pub fn edges(&self) -> impl Iterator<Item = EdgeData> + '_ {
+    pub fn edges(&self) -> impl Iterator<Item = EdgeData<Id>> + '_ {
         self.children
             .iter()
             .zip(&self.edge_data)
@@ -50,7 +56,7 @@ impl TileLang {
     }
 }
 
-fn modulo_rt(rt: &ResTable, ii: usize, n_resources: usize) -> ResTable {
+fn modulo_rt(rt: &ResourceTable, ii: usize, n_resources: usize) -> ResourceTable {
     let mut mrt = vec![vec![0; n_resources]; ii];
     for (row_idx, row) in rt.iter().enumerate() {
         let target = row_idx % ii;
@@ -112,7 +118,7 @@ impl FromOp for TileLang {
     type Error = std::convert::Infallible;
     fn from_op(op: &str, children: Vec<Id>) -> Result<Self, Self::Error> {
         let n = children.len();
-        Ok(Self::new(op, children, vec![(0, 0); n]))
+        Ok(Self::new(op, children, vec![(0, 0); n], vec![]))
     }
 }
 
@@ -127,9 +133,8 @@ struct NodeVars {
     a: Vec<Variable>,
 }
 
-pub struct SwpExtractor<'a, N: Analysis<TileLang>, C: MachineModel> {
+pub struct SwpExtractor<'a, N: Analysis<TileLang>> {
     egraph: &'a EGraph<TileLang, N>,
-    machine_model: C,
     resource_limits: Vec<i32>,
 }
 
@@ -141,15 +146,10 @@ pub struct SwpSolution {
     pub selected: HashMap<Id, (usize, i32)>,
 }
 
-impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
-    pub fn new(
-        egraph: &'a EGraph<TileLang, N>,
-        machine_model: C,
-        resource_limits: Vec<i32>,
-    ) -> Self {
+impl<'a, N: Analysis<TileLang>> SwpExtractor<'a, N> {
+    pub fn new(egraph: &'a EGraph<TileLang, N>, resource_limits: Vec<i32>) -> Self {
         Self {
             egraph,
-            machine_model,
             resource_limits,
         }
     }
@@ -184,13 +184,13 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
 
         let mut node_vars: HashMap<(Id, usize), NodeVars> = HashMap::new();
         let mut node_cost: HashMap<(Id, usize), i32> = HashMap::new();
-        let mut node_mrt: HashMap<(Id, usize), ResTable> = HashMap::new();
+        let mut node_mrt: HashMap<(Id, usize), ResourceTable> = HashMap::new();
         for class in self.egraph.classes() {
             for (j, node) in class.nodes.iter().enumerate() {
                 let key = (class.id, j);
-                let rt = self.machine_model.get_rt(node.op.as_str());
+                let rt = &node.rt;
                 node_cost.insert(key, rt.len() as i32);
-                node_mrt.insert(key, modulo_rt(&rt, ii, n_resources));
+                node_mrt.insert(key, modulo_rt(rt, ii, n_resources));
                 node_vars.insert(
                     key,
                     NodeVars {
@@ -303,168 +303,64 @@ impl<'a, N: Analysis<TileLang>, C: MachineModel> SwpExtractor<'a, N, C> {
     }
 }
 
-pub struct Problem {
-    pub resource_limits: Vec<i32>,
-    // NOTE: A node may only use one kind of resource
-    // (node, duration, resource kind)
-    pub nodes: Vec<(String, i32, usize)>,
-    // (src, dst, d, delta)
-    pub edges: Vec<(usize, usize, i32, i32)>,
+struct DepGraph<'a> {
+    nodes: HashSet<&'a str>,
+    rts: HashMap<&'a str, ResourceTable>,
+    edges: HashMap<&'a str, Vec<EdgeData<&'a str>>>,
 }
 
-pub fn parse_problem(path: &str) -> Problem {
-    let raw = std::fs::read_to_string(path).expect("failed to read problem file");
-    let mut tokens = raw
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or(""))
-        .flat_map(|l| l.split_ascii_whitespace());
-
-    let mut next = || tokens.next().expect("unexpected end of file");
-    let parse_i32 = |s: &str| s.parse::<i32>().expect("expected integer");
-    let parse_usize = |s: &str| s.parse::<usize>().expect("expected unsigned integer");
-
-    assert_eq!(next(), "R");
-    let s = parse_usize(next());
-    let resource_limits: Vec<i32> = (0..s).map(|_| parse_i32(next())).collect();
-
-    assert_eq!(next(), "N");
-    let n = parse_usize(next());
-    let mut nodes = Vec::with_capacity(n);
-    for _ in 0..n {
-        let name = next().to_string();
-        let cost = parse_i32(next());
-        let resource = parse_usize(next());
-        nodes.push((name, cost, resource));
-    }
-
-    assert_eq!(next(), "E");
-    let m = parse_usize(next());
-    let mut edges = Vec::with_capacity(m);
-    for _ in 0..m {
-        let src = parse_usize(next());
-        let dst = parse_usize(next());
-        let d = parse_i32(next());
-        let delta = parse_i32(next());
-        edges.push((src, dst, d, delta));
-    }
-
-    Problem {
-        resource_limits,
-        nodes,
-        edges,
-    }
-}
-
-#[derive(Clone)]
-pub struct TableMachineModel {
-    pub table: HashMap<String, ResTable>,
-}
-
-impl TableMachineModel {
-    pub fn from_problem(problem: &Problem) -> Self {
-        let n_resources = problem.resource_limits.len();
-        let mut table = HashMap::new();
-        for (name, cost, resource) in &problem.nodes {
-            let mut rt = vec![vec![0i32; n_resources]; *cost as usize];
-            for row in &mut rt {
-                row[*resource] = 1;
-            }
-            table.insert(name.clone(), rt);
+impl<'a> DepGraph<'a> {
+    fn new(
+        nodes: Vec<&'a str>,
+        rts: HashMap<&'a str, ResourceTable>,
+        edges: HashMap<&'a str, Vec<EdgeData<&'a str>>>,
+    ) -> Self {
+        let mut set = HashSet::with_capacity(nodes.len());
+        for n in &nodes {
+            assert!(set.insert(*n), "duplicate node name: {n}");
         }
-        Self { table }
+        Self { nodes: set, rts, edges }
     }
-}
 
-impl MachineModel for TableMachineModel {
-    fn get_rt(&self, op: &str) -> ResTable {
-        self.table
-            .get(op)
-            .cloned()
-            .unwrap_or_else(|| panic!("no resource table for op {op}"))
+    fn class_of<N: Analysis<TileLang>>(&self, egraph: &EGraph<TileLang, N>, op: &str) -> Id {
+        egraph
+            .classes()
+            .find(|c| c.nodes.iter().any(|n| n.op.as_str() == op))
+            .map(|c| c.id)
+            .unwrap_or_else(|| panic!("no e-class for op {op}"))
     }
-}
 
-pub fn add_phantom(egraph: &mut EGraph<TileLang, ()>, tag: &str) -> Id {
-    egraph.add(TileLang::leaf(format!("__phantom_{tag}")))
-}
+    fn to_egraph(&self) -> EGraph<TileLang, ()> {
+        let mut egraph: EGraph<TileLang, ()> = EGraph::default();
 
-pub fn strip_phantoms(egraph: &mut EGraph<TileLang, ()>) {
-    egraph.rebuild();
-    for class in egraph.classes_mut() {
-        class
+        let phantoms: HashMap<&str, Id> = self
             .nodes
-            .retain(|node| !node.op.as_str().starts_with("__phantom_"));
+            .iter()
+            .map(|&name| (name, egraph.add(TileLang::leaf(format!("__phantom_{name}")))))
+            .collect();
+
+        for &name in &self.nodes {
+            let in_edges = self.edges.get(name).cloned().unwrap_or_default();
+            let children: Vec<Id> = in_edges.iter().map(|e| phantoms[e.id]).collect();
+            let edge_data: Vec<(i32, i32)> = in_edges.iter().map(|e| (e.d, e.delta)).collect();
+            let rt = self.rts.get(name).cloned().unwrap_or_default();
+            let real = egraph.add(TileLang::new(name, children, edge_data, rt));
+            egraph.union(phantoms[name], real);
+        }
+        egraph.rebuild();
+
+        for class in egraph.classes_mut() {
+            class
+                .nodes
+                .retain(|node| !node.op.as_str().starts_with("__phantom_"));
+        }
+
+        egraph
     }
-}
-
-pub fn add_cyclic(
-    egraph: &mut EGraph<TileLang, ()>,
-    op: &str,
-    children: Vec<Option<Id>>,
-    edge_data: Vec<(i32, i32)>,
-) -> Id {
-    let phantom = add_phantom(egraph, op);
-    let resolved: Vec<Id> = children.iter().map(|c| c.unwrap_or(phantom)).collect();
-    let real = egraph.add(TileLang::new(op, resolved, edge_data));
-    egraph.union(phantom, real);
-    real
-}
-
-pub fn build_egraph(problem: &Problem) -> (EGraph<TileLang, ()>, Vec<Id>) {
-    let n = problem.nodes.len();
-    let mut egraph: EGraph<TileLang, ()> = EGraph::default();
-
-    let phantom: Vec<Id> = (0..n)
-        .map(|i| add_phantom(&mut egraph, &i.to_string()))
-        .collect();
-
-    let mut incoming: Vec<Vec<(usize, i32, i32)>> = vec![Vec::new(); n];
-    for &(src, dst, d, delta) in &problem.edges {
-        incoming[dst].push((src, d, delta));
-    }
-
-    let real: Vec<Id> = (0..n)
-        .map(|v| {
-            let children: Vec<Id> = incoming[v].iter().map(|&(u, _, _)| phantom[u]).collect();
-            let edge_data: Vec<(i32, i32)> =
-                incoming[v].iter().map(|&(_, d, dl)| (d, dl)).collect();
-            egraph.add(TileLang::new(
-                problem.nodes[v].0.as_str(),
-                children,
-                edge_data,
-            ))
-        })
-        .collect();
-
-    for v in 0..n {
-        egraph.union(phantom[v], real[v]);
-    }
-    strip_phantoms(&mut egraph);
-
-    // All e-classes singleton
-    assert_eq!(egraph.number_of_classes(), egraph.total_number_of_nodes());
-
-    // NOTE: To match Python, we force all e-classes! For a real program, there
-    // should a single e-class, corresponding to the output value, that is forced.
-    let roots: Vec<Id> = real.iter().map(|&id| egraph.find(id)).collect();
-    (egraph, roots)
 }
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: sme-swp <problem.swp> [dot_out]");
-    let dot_out = args.next();
-
-    let problem = parse_problem(&path);
-    let (egraph, roots) = build_egraph(&problem);
-
-    if let Some(out) = dot_out.as_deref() {
-        egraph.dot().to_dot(out).expect("failed to write dot file");
-    }
-
-    let model = TableMachineModel::from_problem(&problem);
-    let sol = SwpExtractor::new(&egraph, model, problem.resource_limits.clone()).solve(&roots);
-    println!("RESULT_II={}", sol.ii);
+  todo!("Temporarily removing vibecoded test infra")
 }
 
 #[cfg(test)]
@@ -474,80 +370,74 @@ mod tests {
     #[test]
     fn fa() {
         // for ... { k = load; v = load; s = matmul(q, k); p = softmax(s); o += matmul(v, p) }
-        let mut egraph: EGraph<TileLang, ()> = EGraph::default();
-
-        let q = egraph.add(TileLang::leaf("q"));
-        let k = egraph.add(TileLang::new("k", vec![], vec![]));
-        let v = egraph.add(TileLang::new("v", vec![], vec![]));
-        let s = egraph.add(TileLang::new("s", vec![q, k], vec![(0, 0), (1, 0)]));
-        let p = egraph.add(TileLang::new("p", vec![s], vec![(1, 0)]));
-
-        let o = add_cyclic(
-            &mut egraph,
-            "o",
-            vec![None, Some(v), Some(p)],
-            vec![(1, 1), (1, 0), (2, 0)],
-        );
-        strip_phantoms(&mut egraph);
-
-        let root = egraph.find(o);
+        let nodes = vec!["q", "k", "v", "s", "p", "o"];
 
         // Resources: [TMA, SIMT, TC]
-        let mut rt: HashMap<String, ResTable> = HashMap::new();
-        rt.insert("q".into(), vec![]);
-        rt.insert("k".into(), vec![vec![1, 0, 0]]);
-        rt.insert("v".into(), vec![vec![1, 0, 0]]);
-        rt.insert("s".into(), vec![vec![0, 0, 1]]);
-        rt.insert("p".into(), vec![vec![0, 1, 0], vec![0, 1, 0]]);
-        rt.insert("o".into(), vec![vec![0, 0, 1]]);
-        let model = TableMachineModel { rt };
+        let rts: HashMap<&str, ResourceTable> = HashMap::from([
+            ("q", vec![]),
+            ("k", vec![vec![1, 0, 0]]),
+            ("v", vec![vec![1, 0, 0]]),
+            ("s", vec![vec![0, 0, 1]]),
+            ("p", vec![vec![0, 1, 0], vec![0, 1, 0]]),
+            ("o", vec![vec![0, 0, 1]]),
+        ]);
+
+        let edges: HashMap<&str, Vec<EdgeData<&str>>> = HashMap::from([
+            (
+                "s",
+                vec![
+                    EdgeData { id: "q", d: 0, delta: 0 },
+                    EdgeData { id: "k", d: 1, delta: 0 },
+                ],
+            ),
+            ("p", vec![EdgeData { id: "s", d: 1, delta: 0 }]),
+            (
+                "o",
+                vec![
+                    EdgeData { id: "o", d: 1, delta: 1 },
+                    EdgeData { id: "v", d: 1, delta: 0 },
+                    EdgeData { id: "p", d: 2, delta: 0 },
+                ],
+            ),
+        ]);
+
+        let dep = DepGraph::new(nodes, rts, edges);
+        let egraph = dep.to_egraph();
         let resource_limits = vec![1, 1, 1];
 
-        // egraph
-        //     .dot()
-        //     .to_dot("flash_attention.dot")
-        //     .expect("failed to write dot");
-        // let _ = egraph.dot().to_png("flash_attention.png");
-
-        let sol = SwpExtractor::new(&egraph, model.clone(), resource_limits.clone()).solve(&[root]);
+        let root = dep.class_of(&egraph, "o");
+        let sol = SwpExtractor::new(&egraph, resource_limits.clone()).solve(&[root]);
         println!("ii = {}", sol.ii);
 
-        visualize::render_pipeline(
-            &egraph,
-            &model,
-            &resource_limits,
-            &sol,
-            "fa.svg",
-        )
-        .expect("failed to render pipeline diagram");
+        visualize::render_pipeline(&egraph, &resource_limits, &sol, "fa.svg")
+            .expect("failed to render pipeline diagram");
     }
 
     #[test]
     fn abc() {
-        let mut egraph: EGraph<TileLang, ()> = EGraph::default();
-        let a = egraph.add(TileLang::leaf("a"));
-        let b = egraph.add(TileLang::new("b", vec![a], vec![(1, 0)]));
-        let c = egraph.add(TileLang::new("c", vec![b], vec![(1, 0)]));
-        egraph.rebuild();
+        let nodes = vec!["a", "b", "c"];
+        let rts: HashMap<&str, ResourceTable> = HashMap::from([
+            ("a", vec![vec![1]]),
+            ("b", vec![vec![1]]),
+            ("c", vec![vec![1]]),
+        ]);
+        let edges: HashMap<&str, Vec<EdgeData<&str>>> = HashMap::from([
+            ("b", vec![EdgeData { id: "a", d: 1, delta: 0 }]),
+            ("c", vec![EdgeData { id: "b", d: 1, delta: 0 }]),
+        ]);
 
-        let mut rt: HashMap<String, ResTable> = HashMap::new();
-        rt.insert("a".into(), vec![vec![1]]);
-        rt.insert("b".into(), vec![vec![1]]);
-        rt.insert("c".into(), vec![vec![1]]);
-        rt.insert("x".into(), vec![]);
-        rt.insert("y".into(), vec![]);
-        let model = TableMachineModel { rt };
+        let dep = DepGraph::new(nodes, rts, edges);
+        let egraph = dep.to_egraph();
         let limits = vec![1];
 
-        let sol = SwpExtractor::new(&egraph, model.clone(), limits.clone())
-            .solve(&[egraph.find(c)]);
+        let sol = SwpExtractor::new(&egraph, limits.clone()).solve(&[dep.class_of(&egraph, "c")]);
         assert_eq!(sol.ii, 3);
 
         let rule: Rewrite<TileLang, ()> = rewrite!("ax"; "(b ?x)" => "(x y)");
         let egraph = Runner::default().with_egraph(egraph).run(&[rule]).egraph;
 
-        let sol = SwpExtractor::new(&egraph, model, limits).solve(&[egraph.find(c)]);
-        assert!(!sol.selected.contains_key(&egraph.find(a)));
+        let sol = SwpExtractor::new(&egraph, limits).solve(&[dep.class_of(&egraph, "c")]);
+        assert!(!sol.selected.contains_key(&dep.class_of(&egraph, "a")));
         assert_eq!(sol.ii, 1);
     }
 }
