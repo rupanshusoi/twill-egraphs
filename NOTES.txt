@@ -1,3 +1,40 @@
 The random testing forces all e-classes. I don't see an alternative approach to writing this test, as the e-graph needs to extract all the nodes present in the Python test. When we run an actual dependence graph from a program, there should only be a single e-class that we force.
 
 Dependence edge a->b is reified as edge from e-node b to e-class of a. Doing so lets us associate a (d, delta) with every edge in both representations.
+
+The simplest tiling example I can think of is the following Triton pseudocode.
+
+Before:
+k = load(ptr + arange(0, SIZE))
+s = k ** 2
+return s
+
+After:
+k1 = load(ptr + arange(0, SIZE // 2))
+k2 = load(ptr + arange(SIZE // 2, SIZE))
+s1 = k1 ** 2
+s2 = k2 ** 2
+c = cat(s1, s2)
+return c
+
+Maybe:
+k = join(load(tile(ptr, ...)))
+s = apply(k, lambda x: x ** 2)
+
+Then:
+k = join(load(tile(ptr, ...)))
+s = join(apply(tile(k, ...), lambda x: x ** 2))
+
+I think this results in a bunch of extraneous joins. At each SSA value, you need to join the tiles you are computing over so the outside world never directly sees the tiles. Well, does this repr enable handling of different tiles differently? It's kind of uninteresting if not.
+
+I think the other issue is that I don't see how to create new SSA nodes like k1, k2 via rewriting, and how this new program exists in the e-graph besides the old one.
+
+Codex suggests:
+
+Before:
+(sq (read 0 SIZE))
+
+After:
+(cat
+  (sq (read 0 (div SIZE 2)))
+  (sq (read (div SIZE 2) SIZE)))

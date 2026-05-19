@@ -7,7 +7,7 @@ use svg::Document;
 use svg::node::Text as TextNode;
 use svg::node::element::{Line, Rectangle, Text};
 
-use crate::{MachineModel, SwpSolution, TileLang};
+use crate::{SwpSolution, TileLang};
 
 const PALETTE: &[&str] = &[
     "#e76f51", "#2a9d8f", "#f4a261", "#264653", "#e9c46a", "#8ecae6", "#bb9457", "#c77dff",
@@ -61,16 +61,14 @@ fn vline(x: i32, y0: i32, y1: i32, stroke: &str) -> Line {
         .set("stroke", stroke)
 }
 
-pub fn render_pipeline<N, M>(
+pub fn render_pipeline<N>(
     egraph: &EGraph<TileLang, N>,
-    machine_model: &M,
     resource_limits: &[i32],
     sol: &SwpSolution,
     path: &str,
 ) -> std::io::Result<()>
 where
     N: Analysis<TileLang>,
-    M: MachineModel,
 {
     let ii = sol.ii as i32;
     let l = sol.end as i32;
@@ -84,7 +82,7 @@ where
     debug_assert_eq!(total_cycles, l + (n_iters - 1) * ii);
 
     let duration = class_durations(egraph);
-    let ops = collect_ops(egraph, machine_model, resource_limits.len(), sol, &duration);
+    let ops = collect_ops(egraph, resource_limits.len(), sol, &duration);
     let color = assign_colors(&ops);
     let (placed, lanes_per_resource) = pack_lanes(&ops, resource_limits, ii, n_iters);
 
@@ -185,9 +183,8 @@ fn class_durations<N: Analysis<TileLang>>(egraph: &EGraph<TileLang, N>) -> HashM
     duration
 }
 
-fn collect_ops<N: Analysis<TileLang>, M: MachineModel>(
+fn collect_ops<N: Analysis<TileLang>>(
     egraph: &EGraph<TileLang, N>,
-    machine_model: &M,
     n_resources: usize,
     sol: &SwpSolution,
     duration: &HashMap<Id, i32>,
@@ -195,12 +192,13 @@ fn collect_ops<N: Analysis<TileLang>, M: MachineModel>(
     let mut ops = Vec::new();
     for (&cid, &(node_idx, t)) in &sol.selected {
         let class = egraph.classes().find(|c| c.id == cid).unwrap();
-        let name = class.nodes[node_idx].op.as_str().to_string();
+        let node = &class.nodes[node_idx];
+        let name = node.op.as_str().to_string();
         let d = duration.get(&cid).copied().unwrap_or(0);
         if d == 0 {
             continue;
         }
-        let rt = machine_model.get_rt(&name);
+        let rt = &node.rt;
         let resource = (0..n_resources)
             .find(|&s| rt.iter().any(|row| row[s] != 0))
             .unwrap_or(0);

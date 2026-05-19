@@ -250,7 +250,6 @@ impl<'a, N: Analysis<TileLang>> SwpExtractor<'a, N> {
 
                 // Modulo scheduling dependence constraint
                 // TODO: Can't we merge the previous loop and this one?
-                // FIXME: If I find a better e-node in a child e-class, its d will not change...
                 for edge in node.edges() {
                     let src_t = class_vars[&self.egraph.find(edge.id)].t;
                     let rhs = edge.d - (ii as i32) * edge.delta;
@@ -371,7 +370,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fa() {
+    fn flash_attn() {
         // for ... { k = load; v = load; s = matmul(q, k); p = softmax(s); o += matmul(v, p) }
         let nodes = vec!["q", "k", "v", "s", "p", "o"];
 
@@ -409,14 +408,14 @@ mod tests {
 
         let root = dep.class_of(&egraph, "o");
         let sol = SwpExtractor::new(&egraph, &dep.resource_limits).solve(&[root]);
-        println!("ii = {}", sol.ii);
+        assert_eq!(sol.ii, 2);
 
         visualize::render_pipeline(&egraph, &dep.resource_limits, &sol, "fa.svg")
             .expect("failed to render pipeline diagram");
     }
 
     #[test]
-    fn abc() {
+    fn chain() {
         let nodes = vec!["a", "b", "c"];
         let rts: HashMap<&str, ResourceTable> = HashMap::from([
             ("a", vec![vec![1]]),
